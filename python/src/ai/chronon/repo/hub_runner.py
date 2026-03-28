@@ -14,7 +14,7 @@ from ai.chronon.cli.formatter import (
     format_print,
     jsonify_exceptions_if_json_format,
 )
-from ai.chronon.cli.git_utils import get_current_branch
+from ai.chronon.cli.git_utils import get_current_branch, get_git_user_email
 from ai.chronon.cli.theme import (
     print_error,
     print_info,
@@ -25,7 +25,6 @@ from ai.chronon.cli.theme import (
 )
 from ai.chronon.click_helpers import handle_compile, handle_conf_not_found, handle_dry_run_compile
 from ai.chronon.repo import hub_uploader, utils
-from ai.chronon.repo.auth import get_user_email
 from ai.chronon.repo.constants import VALID_CLOUDS, RunMode
 from ai.chronon.repo.utils import print_possible_confs, upload_to_blob_store
 from ai.chronon.repo.zipline_hub import ZiplineHub
@@ -176,6 +175,10 @@ def conf_argument(func):
     return click.argument("conf")(func)
 
 
+def confs_argument(func):
+    return click.argument("confs", nargs=-1, required=True)(func)
+
+
 def ds_option(func):
     return click.option(
         "--date",
@@ -229,8 +232,53 @@ def _get_zipline_hub(
         cloud_provider=hub_conf.cloud_provider,
         scope=scope,
         format=format,
+    )
+
+
+def _get_eval_zipline_hub(
+    hub_conf: HubConfig,
+    hub_url: Optional[str],
+    use_auth: bool,
+    eval_url: Optional[str],
+    format: Format,
+):
+    scope = ""
+    if hub_conf.auth_scope is not None:
+        scope = hub_conf.auth_scope
+    elif hub_conf.cloud_provider == "azure" and hub_conf.customer_id is not None:
+        scope = f"api://{hub_conf.customer_id}-zipline-auth"
+    return ZiplineHub(
+        base_url=hub_url or hub_conf.hub_url,
+        sa_name=hub_conf.sa_name,
+        use_auth=use_auth,
+        eval_url=eval_url or hub_conf.eval_url,
+        cloud_provider=hub_conf.cloud_provider,
+        scope=scope,
+        format=format,
         auth_url=hub_conf.frontend_url,
     )
+
+
+def _build_eval_parameters(
+    hub_conf: HubConfig,
+    generate_test_config: bool,
+    test_data_path: Optional[str],
+):
+    parameters = {}
+    if test_data_path:
+        if hub_conf.cloud_provider != "gcp":
+            raise RuntimeError("Test data path is only supported for GCP.")
+        zipline_artifact_prefix = (
+            hub_conf.artifact_prefix.rstrip("/") if hub_conf.artifact_prefix else ""
+        )
+        if not zipline_artifact_prefix:
+            raise click.UsageError("Zipline artifact prefix is not set.")
+        url = f"eval/test_data/{os.path.basename(test_data_path)}"
+        upload_to_blob_store(test_data_path, f"{zipline_artifact_prefix}/{url}")
+        parameters["testDataPath"] = f"{zipline_artifact_prefix}/{url}"
+    if generate_test_config:
+        parameters["generateTestDataSkeleton"] = "true"
+    return parameters
 
 
 def submit_schedule_all(
@@ -400,7 +448,7 @@ def submit_workflow(
             conf_name=conf_name,
             mode=mode,
             branch=branch,
-            user=get_user_email(),
+            user=get_git_user_email(),
             start=start_ds,
             end=end_ds,
             conf_hash=conf_name_to_hash_dict[conf_name].hash,
@@ -757,7 +805,7 @@ def fetch(conf, repo, hub_url, use_auth, format, force, fetcher_url, schema, key
 # zipline hub eval compiled/joins/join
 # localSparkSession evaluation of conf
 @hub.command()
-@conf_argument
+@confs_argument
 @common_options
 @click.option(
     "--eval-url",
@@ -777,11 +825,10 @@ def fetch(conf, repo, hub_url, use_auth, format, force, fetcher_url, schema, key
     type=str,
     default=None,
 )
-@handle_conf_not_found(log_error=True, callback=print_possible_confs)
 @handle_compile
 @jsonify_exceptions_if_json_format
 def eval(
-    conf,
+    confs,
     repo,
     hub_url,
     use_auth,
@@ -794,65 +841,65 @@ def eval(
 ):
     """Validate a conf against source tables and schemas.
 
-    CONF is the path to the compiled conf (e.g. compiled/joins/team/my_join).
+    CONFS are paths to compiled confs (e.g. compiled/joins/team/my_join).
     """
-    parameters = {}
-    hub_conf = get_hub_conf(conf, root_dir=repo)
-    scope = ""
-    if hub_conf.auth_scope is not None:
-        scope = hub_conf.auth_scope
-    elif hub_conf.cloud_provider == "azure" and hub_conf.customer_id is not None:
-        scope = f"api://{hub_conf.customer_id}-zipline-auth"
-    zipline_hub = ZiplineHub(
-        base_url=hub_url or hub_conf.hub_url,
-        sa_name=hub_conf.sa_name,
-        use_auth=use_auth,
-        eval_url=eval_url or hub_conf.eval_url,
-        cloud_provider=hub_conf.cloud_provider,
-        scope=scope,
-        format=format,
-        auth_url=hub_conf.frontend_url,
-    )
     conf_name_to_hash_dict = hub_uploader.build_local_repo_hashmap(root_dir=repo)
     branch = get_current_branch()
-    if test_data_path:
-        # Upload the test data skeleton to the bucket.
-        if hub_conf.cloud_provider != "gcp":
-            raise RuntimeError("Test data path is only supported for GCP.")
-        # import here to avoid dependency for other clouds.
-        zipline_artifact_prefix = (
-            hub_conf.artifact_prefix.rstrip("/") if hub_conf.artifact_prefix else ""
+    conf_hash_map = {conf_obj.name: conf_obj.hash for conf_obj in conf_name_to_hash_dict.values()}
+    multi = len(confs) > 1
+    hub_cache = {}
+    responses = []
+    for conf in confs:
+        try:
+            hub_conf = get_hub_conf(conf, root_dir=repo)
+        except FileNotFoundError as e:
+            print_error(f"File not found in eval: {e}", format=format)
+            print_possible_confs(conf, repo)
+            continue
+
+        parameters = _build_eval_parameters(
+            hub_conf=hub_conf,
+            generate_test_config=generate_test_config,
+            test_data_path=test_data_path,
         )
-        if not zipline_artifact_prefix:
-            raise click.UsageError("Zipline artifact prefix is not set.")
-        url = f"eval/test_data/{os.path.basename(test_data_path)}"
-        upload_to_blob_store(test_data_path, f"{zipline_artifact_prefix}/{url}")
-        parameters["testDataPath"] = f"{zipline_artifact_prefix}/{url}"
+        effective_url = hub_url or hub_conf.hub_url
+        if effective_url not in hub_cache:
+            hub_cache[effective_url] = _get_eval_zipline_hub(
+                hub_conf=hub_conf,
+                hub_url=hub_url,
+                use_auth=use_auth,
+                eval_url=eval_url,
+                format=format,
+            )
+            hub_uploader.compute_and_upload_diffs(
+                branch, zipline_hub=hub_cache[effective_url], local_repo_confs=conf_name_to_hash_dict
+            )
+        zipline_hub = hub_cache[effective_url]
+        conf_name = utils.get_metadata_name_from_conf(repo, conf)
+        response_json = zipline_hub.call_eval_api(
+            conf_name=conf_name,
+            conf_hash_map=conf_hash_map,
+            parameters=parameters,
+        )
+        responses.append({"conf": conf, "response": response_json})
 
-    hub_uploader.compute_and_upload_diffs(
-        branch, zipline_hub=zipline_hub, local_repo_confs=conf_name_to_hash_dict
-    )
+    overall_success = all(result["response"].get("success") for result in responses)
 
-    # get conf name
-    conf_name = utils.get_metadata_name_from_conf(repo, conf)
-    if generate_test_config:
-        parameters["generateTestDataSkeleton"] = "true"
-    response_json = zipline_hub.call_eval_api(
-        conf_name=conf_name,
-        conf_hash_map={
-            conf.name: conf.hash for conf in conf_name_to_hash_dict.values()
-        },
-        parameters=parameters,
-    )
     if format == Format.JSON:
-        print(json.dumps(response_json, indent=4))
-        sys.exit(0 if response_json.get("success") else 1)
-    if response_json.get("success"):
-        print_success("Eval job finished successfully.", format=format)
+        payload = responses[0]["response"] if not multi else {"status": "success" if overall_success else "error", "results": responses}
+        print(json.dumps(payload, indent=4))
+        sys.exit(0 if overall_success else 1)
+
+    for result in responses:
+        response_json = result["response"]
+        label = f" for {result['conf']}" if multi else ""
+        if response_json.get("success"):
+            print_success(f"Eval job finished successfully{label}.", format=format)
+        else:
+            print_error(f"Eval job failed{label}.", format=format)
         format_print(response_json.get("message"), format=format)
-    else:
-        print_error("Eval job failed.", format=format)
-        format_print(response_json.get("message"), format=format)
+
+    if not overall_success:
         sys.exit(1)
 
 
@@ -934,7 +981,6 @@ def eval_table(
         cloud_provider=hub_conf.cloud_provider,
         scope=scope,
         format=format,
-        auth_url=hub_conf.frontend_url,
     )
 
     execution_info = (
@@ -1024,7 +1070,6 @@ def list_tables(schema_name, repo, team, hub_url, use_auth, format, eval_url, en
         cloud_provider=hub_conf.cloud_provider,
         scope=scope,
         format=format,
-        auth_url=hub_conf.frontend_url,
     )
 
     response_json = zipline_hub.call_list_tables_api(
