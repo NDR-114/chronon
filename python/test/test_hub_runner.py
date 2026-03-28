@@ -11,7 +11,8 @@
 #     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #     See the License for the specific language governing permissions and
 #     limitations under the License.
-from unittest.mock import patch
+import json
+from unittest.mock import Mock, patch
 
 from click.testing import CliRunner
 from rich.text import Text
@@ -52,6 +53,121 @@ class TestHubRunner:
         result = self._run_and_print(runner, hub, ["--help"])
         assert result.exit_code == 0
         assert "Usage:" in result.output
+
+    @patch('ai.chronon.click_helpers.__compile')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    @patch('ai.chronon.repo.hub_runner.utils.get_metadata_name_from_conf')
+    @patch('ai.chronon.repo.hub_runner.get_hub_conf')
+    @patch('ai.chronon.repo.zipline_hub.requests.post')
+    def test_eval_supports_multiple_confs(
+        self,
+        mock_post,
+        mock_get_hub_conf,
+        mock_get_metadata_name,
+        mock_get_current_branch,
+        mock_compute_and_upload_diffs,
+        mock_compile,
+        canary,
+        online_join_conf,
+    ):
+        """Test eval command supports multiple conf arguments."""
+        mock_compile.return_value = ({}, False, {"added": [], "changed": [], "deleted": []})
+        mock_get_current_branch.return_value = "test-branch"
+        mock_compute_and_upload_diffs.return_value = None
+        mock_get_hub_conf.return_value = Mock(
+            hub_url='http://localhost:3903',
+            frontend_url='http://localhost:3000',
+            eval_url=None,
+            sa_name=None,
+            cloud_provider='gcp',
+            auth_scope=None,
+            customer_id=None,
+            artifact_prefix=None,
+        )
+        mock_get_metadata_name.side_effect = ['gcp.demo.v1', 'gcp.user_activities.v1']
+        mock_post.side_effect = [
+            Mock(json=Mock(return_value={"success": True, "message": "join ok"}), raise_for_status=Mock()),
+            Mock(json=Mock(return_value={"success": True, "message": "group by ok"}), raise_for_status=Mock()),
+        ]
+
+        second_conf = 'compiled/group_bys/gcp/user_activities.v1'
+        runner = CliRunner()
+        result = self._run_and_print(runner, hub, [
+            'eval',
+            online_join_conf,
+            second_conf,
+            '--repo', canary,
+            '--no-use-auth',
+            '--eval-url', 'http://localhost:3904',
+        ])
+
+        assert result.exit_code == 0
+        plain_output = ' '.join(_plain(result.output).split())
+        assert f"Eval job finished successfully for {online_join_conf}." in plain_output
+        assert f"Eval job finished successfully for {second_conf}." in plain_output
+        assert mock_post.call_count == 2
+
+        first_payload = mock_post.call_args_list[0][1]['json']
+        second_payload = mock_post.call_args_list[1][1]['json']
+        assert first_payload['confName'] == 'gcp.demo.v1'
+        assert second_payload['confName'] == 'gcp.user_activities.v1'
+
+    @patch('ai.chronon.click_helpers.__compile')
+    @patch('ai.chronon.repo.hub_runner.hub_uploader.compute_and_upload_diffs')
+    @patch('ai.chronon.repo.hub_runner.get_current_branch')
+    @patch('ai.chronon.repo.hub_runner.utils.get_metadata_name_from_conf')
+    @patch('ai.chronon.repo.hub_runner.get_hub_conf')
+    @patch('ai.chronon.repo.zipline_hub.requests.post')
+    def test_eval_multiple_confs_json_output(
+        self,
+        mock_post,
+        mock_get_hub_conf,
+        mock_get_metadata_name,
+        mock_get_current_branch,
+        mock_compute_and_upload_diffs,
+        mock_compile,
+        canary,
+        online_join_conf,
+    ):
+        """Test eval emits aggregated JSON for multiple conf arguments."""
+        mock_compile.return_value = ({}, False, {"added": [], "changed": [], "deleted": []})
+        mock_get_current_branch.return_value = "test-branch"
+        mock_compute_and_upload_diffs.return_value = None
+        mock_get_hub_conf.return_value = Mock(
+            hub_url='http://localhost:3903',
+            frontend_url='http://localhost:3000',
+            eval_url=None,
+            sa_name=None,
+            cloud_provider='gcp',
+            auth_scope=None,
+            customer_id=None,
+            artifact_prefix=None,
+        )
+        mock_get_metadata_name.side_effect = ['gcp.demo.v1', 'gcp.user_activities.v1']
+        mock_post.side_effect = [
+            Mock(json=Mock(return_value={"success": True, "message": "join ok"}), raise_for_status=Mock()),
+            Mock(json=Mock(return_value={"success": False, "message": "group by failed"}), raise_for_status=Mock()),
+        ]
+
+        second_conf = 'compiled/group_bys/gcp/user_activities.v1'
+        runner = CliRunner()
+        result = self._run_and_print(runner, hub, [
+            'eval',
+            online_join_conf,
+            second_conf,
+            '--repo', canary,
+            '--no-use-auth',
+            '--eval-url', 'http://localhost:3904',
+            '--format', 'json',
+        ])
+
+        assert result.exit_code == 1
+        response_json = json.loads(result.output)
+        assert response_json['status'] == 'error'
+        assert [entry['conf'] for entry in response_json['results']] == [online_join_conf, second_conf]
+        assert response_json['results'][0]['response']['success'] is True
+        assert response_json['results'][1]['response']['success'] is False
 
     @patch('requests.post')
     @patch('ai.chronon.repo.hub_runner.get_current_branch')

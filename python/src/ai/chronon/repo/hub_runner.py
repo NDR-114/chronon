@@ -883,6 +883,9 @@ def eval(
         )
         responses.append({"conf": conf, "response": response_json})
 
+    if not responses:
+        sys.exit(1)
+
     overall_success = all(result["response"].get("success") for result in responses)
 
     if format == Format.JSON:
